@@ -45,6 +45,7 @@ from contextlib import asynccontextmanager
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
@@ -449,6 +450,46 @@ def find_closest_title(title: str, result_titles: List[str]) -> int:
 
 # =================== 同步核心函数（使用浏览器池）===================
 
+def _dismiss_cnki_popups(driver) -> bool:
+    """尝试关闭 CNKI 首页的弹窗/遮罩（如有）"""
+    popup_selectors = [
+        (By.ID, "close"),
+        (By.CLASS_NAME, "close"),
+        (By.XPATH, '//div[contains(@class,"popup")]//a[contains(text(),"关闭")]'),
+        (By.XPATH, '//div[contains(@class,"modal")]//button[contains(text(),"关闭")]'),
+        (By.XPATH, '//div[contains(@class,"layui-layer")]//a[contains(@class,"layui-layer-close")]'),
+    ]
+    for by, selector in popup_selectors:
+        try:
+            elem = driver.find_element(by, selector)
+            driver.execute_script("arguments[0].click();", elem)
+            time.sleep(0.5)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _submit_search(driver, search_box) -> None:
+    """稳健的搜索提交：先尝试关闭弹窗，再通过 JS 点击或回车提交"""
+    _dismiss_cnki_popups(driver)
+    time.sleep(0.3)
+
+    # 方法1: JS 点击搜索按钮（可绕过 Selenium 的 click intercepted 检查）
+    try:
+        search_btn = driver.find_element(By.CLASS_NAME, "search-btn")
+        driver.execute_script("arguments[0].click();", search_btn)
+        return
+    except Exception:
+        pass
+
+    # 方法2: 回车提交
+    try:
+        search_box.send_keys(Keys.RETURN)
+    except Exception:
+        pass
+
+
 def _search_cnki_sync(browser_pool: BrowserPool, query: str, search_type: str = "主题", pages: int = 1, sort: str = "相关度") -> dict:
     """同步版本的 CNKI 搜索（使用浏览器池）"""
     resolved_type = resolve_search_type(search_type)
@@ -471,14 +512,14 @@ def _search_cnki_sync(browser_pool: BrowserPool, query: str, search_type: str = 
         for char in query:
             search_box.send_keys(char)
             time.sleep(random.uniform(0.03, 0.08))
-        
-        driver.find_element(By.CLASS_NAME, "search-btn").click()
+
+        _submit_search(driver, search_box)
         time.sleep(random.uniform(2, 3))
-        
+
         # 应用排序（如果不是默认的相关度）
         if resolved_sort != "相关度":
             apply_sort(driver, resolved_sort)
-        
+
         # 遍历每一页
         for page_num in range(1, pages + 1):
             try:
@@ -679,8 +720,8 @@ def _find_best_match_sync(browser_pool: BrowserPool, query: str) -> dict:
         for char in query:
             search_box.send_keys(char)
             time.sleep(random.uniform(0.03, 0.08))
-        
-        driver.find_element(By.CLASS_NAME, "search-btn").click()
+
+        _submit_search(driver, search_box)
         time.sleep(random.uniform(2, 3))
         
         result_titles = []
