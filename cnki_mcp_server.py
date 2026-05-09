@@ -231,6 +231,9 @@ mcp = FastMCP(
       - 支持: 主题、关键词、作者、篇名、作者单位、全文、DOI 等
       - 英文别名: subject, keyword, author, title, affiliation, fulltext, doi
     - pages: 搜索页数（可选，默认1页，每页约20条）
+    - sort: 排序方式（可选，默认"相关度"）
+      - 支持: 相关度、发表时间、被引、下载、综合
+      - 英文别名: relevance, date, cited, download, composite
     
     ### get_paper_detail
     获取论文详情页的完整信息。
@@ -252,6 +255,8 @@ mcp = FastMCP(
     1. 先用 search_cnki 搜索论文列表
     2. 从结果中选择目标论文的 URL
     3. 用 get_paper_detail 获取完整详情
+    4. 使用 sort="被引" 查找高被引论文
+    5. 使用 sort="发表时间" 查找最新论文
     
     ## 注意事项
     - 每次搜索建议 1-3 页，避免过多请求
@@ -286,6 +291,30 @@ SEARCH_TYPE_ALIASES = {
     "reference": "参考文献", "source": "文献来源", "doi": "DOI",
 }
 
+# CNKI 排序类型映射（中文名 -> DOM ID）
+SORT_TYPES = {
+    "相关度": "FFD",
+    "发表时间": "PT",
+    "被引": "CF",
+    "下载": "DFR",
+    "综合": "ZH",
+}
+
+# 排序类型英文别名
+SORT_TYPE_ALIASES = {
+    "relevance": "相关度",
+    "date": "发表时间",
+    "publish_time": "发表时间",
+    "time": "发表时间",
+    "cited": "被引",
+    "citation": "被引",
+    "citations": "被引",
+    "download": "下载",
+    "downloads": "下载",
+    "composite": "综合",
+    "general": "综合",
+}
+
 
 # =================== 工具函数 ===================
 
@@ -299,6 +328,18 @@ def resolve_search_type(search_type: str) -> str:
     if search_type in SEARCH_TYPES:
         return search_type
     return "主题"
+
+
+def resolve_sort_type(sort_type: str) -> str:
+    """解析排序类型，支持中文或英文别名"""
+    if not sort_type:
+        return "相关度"
+    sort_type_lower = sort_type.lower().strip()
+    if sort_type_lower in SORT_TYPE_ALIASES:
+        return SORT_TYPE_ALIASES[sort_type_lower]
+    if sort_type in SORT_TYPES:
+        return sort_type
+    return "相关度"
 
 
 def select_search_type(driver, search_type: str) -> bool:
@@ -317,6 +358,40 @@ def select_search_type(driver, search_type: str) -> bool:
         )
         option.click()
         time.sleep(0.5)
+        return True
+    except Exception:
+        return False
+
+
+def apply_sort(driver, sort_type: str) -> bool:
+    """
+    在搜索结果页面应用排序
+    
+    Args:
+        driver: Selenium WebDriver
+        sort_type: 中文排序类型名称（相关度、发表时间、被引、下载、综合）
+    
+    Returns:
+        bool: 是否成功应用排序
+    """
+    try:
+        sort_id = SORT_TYPES.get(sort_type)
+        if not sort_id:
+            return False
+        
+        # 点击排序按钮
+        sort_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.ID, sort_id))
+        )
+        sort_btn.click()
+        time.sleep(random.uniform(1.5, 2.5))
+        
+        # 等待结果表格重新加载
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located(
+                (By.XPATH, '//table[@class="result-table-list"]//tbody//tr')
+            )
+        )
         return True
     except Exception:
         return False
@@ -374,9 +449,10 @@ def find_closest_title(title: str, result_titles: List[str]) -> int:
 
 # =================== 同步核心函数（使用浏览器池）===================
 
-def _search_cnki_sync(browser_pool: BrowserPool, query: str, search_type: str = "主题", pages: int = 1) -> dict:
+def _search_cnki_sync(browser_pool: BrowserPool, query: str, search_type: str = "主题", pages: int = 1, sort: str = "相关度") -> dict:
     """同步版本的 CNKI 搜索（使用浏览器池）"""
     resolved_type = resolve_search_type(search_type)
+    resolved_sort = resolve_sort_type(sort)
     all_papers = []
     
     try:
@@ -398,6 +474,10 @@ def _search_cnki_sync(browser_pool: BrowserPool, query: str, search_type: str = 
         
         driver.find_element(By.CLASS_NAME, "search-btn").click()
         time.sleep(random.uniform(2, 3))
+        
+        # 应用排序（如果不是默认的相关度）
+        if resolved_sort != "相关度":
+            apply_sort(driver, resolved_sort)
         
         # 遍历每一页
         for page_num in range(1, pages + 1):
@@ -430,6 +510,7 @@ def _search_cnki_sync(browser_pool: BrowserPool, query: str, search_type: str = 
         return {
             "query": query,
             "search_type": resolved_type,
+            "sort": resolved_sort,
             "total_pages": pages,
             "total_papers": len(all_papers),
             "papers": all_papers
@@ -656,6 +737,9 @@ async def search_cnki(
         ge=1,
         le=10
     )] = 1,
+    sort: Annotated[str, Field(
+        description="排序方式: 相关度、发表时间、被引、下载、综合 (英文: relevance, date, cited, download, composite)"
+    )] = "相关度",
     browser_pool: BrowserPool = Depends(get_browser_pool)
 ) -> dict:
     """
@@ -668,16 +752,19 @@ async def search_cnki(
             - 中文：主题、关键词、作者、篇名、作者单位、全文、DOI、基金、摘要
             - 英文：subject, keyword, author, title, affiliation, fulltext, doi
         pages: 搜索页数（1-10），每页约20条结果
+        sort: 排序方式，支持：
+            - 中文：相关度、发表时间、被引、下载、综合
+            - 英文：relevance, date, cited, download, composite
     
     Returns:
         包含论文列表的字典，每篇论文包含：title, url, authors, source, date, cited_count
     """
-    await ctx.info(f"开始搜索 CNKI: query='{query}', type='{search_type}', pages={pages}")
+    await ctx.info(f"开始搜索 CNKI: query='{query}', type='{search_type}', sort='{sort}', pages={pages}")
     await ctx.report_progress(progress=0, total=100)
     
     # 使用 asyncer 在后台线程中执行同步操作
     result = await asyncer.asyncify(_search_cnki_sync)(
-        browser_pool, query, search_type, pages
+        browser_pool, query, search_type, pages, sort
     )
     
     await ctx.report_progress(progress=100, total=100)
